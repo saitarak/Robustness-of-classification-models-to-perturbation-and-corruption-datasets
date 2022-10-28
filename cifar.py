@@ -30,11 +30,14 @@ import time
 import augmentations
 from models.cifar.allconv import AllConvNet
 import numpy as np
+from torch import nn, optim
 from third_party.ResNeXt_DenseNet.models.densenet import densenet
 from third_party.ResNeXt_DenseNet.models.resnext import resnext29
 from third_party.WideResNet_pytorch.wideresnet import WideResNet
+from third_party.ResNeXt_DenseNet.models.resnet import resnet
 
 import torch
+import torchvision
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets
@@ -54,7 +57,7 @@ parser.add_argument(
     '-m',
     type=str,
     default='wrn',
-    choices=['wrn', 'allconv', 'densenet', 'resnext'],
+    choices=['wrn', 'allconv', 'densenet', 'resnext', 'resnet', 'convnext'],
     help='Choose architecture.')
 # Optimization options
 parser.add_argument(
@@ -160,6 +163,7 @@ def aug(image, preprocess):
     mixed: Augmented and mixed image.
   """
   aug_list = augmentations.augmentations
+
   if args.all_ops:
     aug_list = augmentations.augmentations_all
 
@@ -167,6 +171,7 @@ def aug(image, preprocess):
   m = np.float32(np.random.beta(1, 1))
 
   mix = torch.zeros_like(preprocess(image))
+  
   for i in range(args.mixture_width):
     image_aug = image.copy()
     depth = args.mixture_depth if args.mixture_depth > 0 else np.random.randint(
@@ -338,6 +343,12 @@ def main():
     net = AllConvNet(num_classes)
   elif args.model == 'resnext':
     net = resnext29(num_classes=num_classes)
+  elif args.model == 'resnet':
+    net = torchvision.models.resnet18(pretrained=False)
+    net.fc = nn.Linear(net.fc.in_features,10)
+  elif args.model == 'convnext':
+    net = torchvision.models.convnext_tiny(pretrained=False)
+    net.classifier[2] = nn.Linear(in_features=768,out_features=10)
 
   optimizer = torch.optim.SGD(
       net.parameters(),
