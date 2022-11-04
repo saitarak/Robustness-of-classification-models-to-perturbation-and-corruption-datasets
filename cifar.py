@@ -34,7 +34,7 @@ from torch import nn, optim
 from third_party.ResNeXt_DenseNet.models.densenet import densenet
 from third_party.ResNeXt_DenseNet.models.resnext import resnext29
 from third_party.WideResNet_pytorch.wideresnet import WideResNet
-from third_party.ResNeXt_DenseNet.models.resnet import resnet
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 import torchvision
@@ -57,7 +57,7 @@ parser.add_argument(
     '-m',
     type=str,
     default='wrn',
-    choices=['wrn', 'allconv', 'densenet', 'resnext', 'resnet', 'convnext'],
+    choices=['wrn', 'allconv', 'densenet', 'resnext', 'nptresnet', 'ptresnet', 'nptconvnext', 'ptconvnext'],
     help='Choose architecture.')
 # Optimization options
 parser.add_argument(
@@ -137,6 +137,8 @@ parser.add_argument(
     help='Number of pre-fetching threads.')
 
 args = parser.parse_args()
+
+writer = SummaryWriter('logs/'+args.model)
 
 CORRUPTIONS = [
     'gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur',
@@ -343,11 +345,17 @@ def main():
     net = AllConvNet(num_classes)
   elif args.model == 'resnext':
     net = resnext29(num_classes=num_classes)
-  elif args.model == 'resnet':
+  elif args.model == 'nptresnet':
     net = torchvision.models.resnet18(pretrained=False)
     net.fc = nn.Linear(net.fc.in_features,10)
-  elif args.model == 'convnext':
+  elif args.model == 'ptresnet':
+    net = torchvision.models.resnet18(pretrained=True)
+    net.fc = nn.Linear(net.fc.in_features,10)
+  elif args.model == 'nptconvnext':
     net = torchvision.models.convnext_tiny(pretrained=False)
+    net.classifier[2] = nn.Linear(in_features=768,out_features=10)
+  elif args.model == 'ptconvnext':
+    net = torchvision.models.convnext_tiny(pretrained=True)
     net.classifier[2] = nn.Linear(in_features=768,out_features=10)
 
   optimizer = torch.optim.SGD(
@@ -432,6 +440,10 @@ def main():
           test_loss,
           100 - 100. * test_acc,
       ))
+    
+    writer.add_scalar('logs/train', train_loss_ema, epoch+1)
+    writer.add_scalar('logs/test', test_loss, epoch+1)
+    writer.add_scalar('acc/test', test_acc, epoch+1)
 
     print(
         'Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Test Loss {3:.3f} |'
