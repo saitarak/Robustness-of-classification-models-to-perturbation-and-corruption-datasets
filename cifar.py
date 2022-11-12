@@ -42,6 +42,8 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets
 from torchvision import transforms
+from scipy.stats import rankdata
+import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(
     description='Trains a CIFAR Classifier',
@@ -52,6 +54,20 @@ parser.add_argument(
     default='cifar10',
     choices=['cifar10', 'cifar100'],
     help='Choose between CIFAR-10, CIFAR-100.')
+parser.add_argument(
+    '--optimizer',
+    '-op',
+    type=str,
+    default='SGD',
+    choices=['SGD', 'Adamw'],
+    help='Choose between SGD, Adamw.')
+parser.add_argument(
+    '--scheduler',
+    '-sc',
+    type=str,
+    default='lambda_lr',
+    choices=['lambda_lr', 'cosine_annealing'],
+    help='Choose between lambda_lr, cosine_annealing.')
 parser.add_argument(
     '--model',
     '-m',
@@ -146,6 +162,8 @@ CORRUPTIONS = [
     'brightness', 'contrast', 'elastic_transform', 'pixelate',
     'jpeg_compression'
 ]
+PERTURBATIONS = ['gaussian_noise', 'shot_noise', 'motion_blur', 'zoom_blur',
+                 'spatter', 'brightness', 'translate', 'rotate', 'tilt', 'scale']
 
 
 def get_lr(step, total_steps, lr_max, lr_min):
@@ -292,6 +310,84 @@ def test_c(net, test_data, base_path):
 
   return np.mean(corruption_accs)
 
+concat = lambda x: np.concatenate(x, axis=0)
+to_np = lambda x: x.data.to('cpu').numpy()
+num_classes=10
+
+def evaluate(net,loader):
+    confidence = []
+    correct = []
+
+    num_correct = 0
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.cuda(), target.cuda()
+            output = net(2 * data - 1)
+
+            # accuracy
+            pred = output.data.max(1)[1]
+            num_correct += pred.eq(target.data).sum().item()
+
+            confidence.extend(to_np(F.softmax(output, dim=1).max(1)[0]).squeeze().tolist())
+            pred = output.data.max(1)[1]
+            correct.extend(pred.eq(target).to('cpu').numpy().squeeze().tolist())
+
+    return num_correct / len(loader.dataset), np.array(confidence), np.array(correct)
+
+args.difficulty = 1
+identity = np.asarray(range(1, num_classes+1))
+cum_sum_top5 = np.cumsum(np.asarray([0] + [1] * 5 + [0] * (num_classes-1 - 5)))
+recip = 1./identity
+
+
+def dist(sigma, mode='top5'):
+    if mode == 'top5':
+        return np.sum(np.abs(cum_sum_top5[:5] - cum_sum_top5[sigma-1][:5]))
+    elif mode == 'zipf':
+        return np.sum(np.abs(recip - recip[sigma-1])*recip)
+
+
+def ranking_dist(ranks, noise_perturbation=False, mode='top5'):
+    result = 0
+    step_size = 1 if noise_perturbation else args.difficulty
+    
+    for vid_ranks in ranks:
+        result_for_vid = []
+
+        for i in range(step_size):
+            perm1 = vid_ranks[i]
+            perm1_inv = np.argsort(perm1)
+
+            for rank in vid_ranks[i::step_size][1:]:
+                perm2 = rank
+                result_for_vid.append(dist(perm2[perm1_inv], mode))
+                if not noise_perturbation:
+                    perm1 = perm2
+                    perm1_inv = np.argsort(perm1)
+
+        result += np.mean(result_for_vid) / len(ranks)
+
+    return result
+
+
+def flip_prob(predictions, noise_perturbation=False):
+    result = 0
+    step_size = 1 if noise_perturbation else args.difficulty
+
+    for vid_preds in predictions:
+        result_for_vid = []
+
+        for i in range(step_size):
+            prev_pred = vid_preds[i]
+
+            for pred in vid_preds[i::step_size][1:]:
+                result_for_vid.append(int(prev_pred != pred))
+                if not noise_perturbation: prev_pred = pred
+
+        result += np.mean(result_for_vid) / len(predictions)
+
+    return result
+    
 
 def main():
   torch.manual_seed(1)
@@ -312,6 +408,7 @@ def main():
     test_data = datasets.CIFAR10(
         './data/cifar', train=False, transform=test_transform, download=True)
     base_c_path = './data/cifar/CIFAR-10-C/'
+    base_p_path = './data/cifar/CIFAR-10-P/'
     num_classes = 10
   else:
     train_data = datasets.CIFAR100(
@@ -358,13 +455,21 @@ def main():
     net = torchvision.models.convnext_tiny(pretrained=True)
     net.classifier[2] = nn.Linear(in_features=768,out_features=10)
 
-  optimizer = torch.optim.SGD(
+  if args.optimizer == 'SGD':
+    optimizer = torch.optim.SGD(
       net.parameters(),
       args.learning_rate,
       momentum=args.momentum,
       weight_decay=args.decay,
       nesterov=True)
-
+  elif args.optimizer == 'Adamw':
+    optimizer = torch.optim.AdamW(
+      net.parameters(), 
+      args.learning_rate, 
+      betas=(0.9,0.999),
+      eps=1e-08,
+      weight_decay=args.decay)
+      
   # Distribute model across all visible GPUs
   net = torch.nn.DataParallel(net).cuda()
   cudnn.benchmark = True
@@ -390,14 +495,19 @@ def main():
     print('Mean Corruption Error: {:.3f}'.format(100 - 100. * test_c_acc))
     return
 
-  scheduler = torch.optim.lr_scheduler.LambdaLR(
+  if args.scheduler == 'lambda_lr':
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
       optimizer,
       lr_lambda=lambda step: get_lr(  # pylint: disable=g-long-lambda
           step,
           args.epochs * len(train_loader),
           1,  # lr_lambda computes multiplicative factor
           1e-6 / args.learning_rate))
-
+  
+  elif args.scheduler == 'cosine_annealing':
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+      optimizer, T_max = len(train_loader)*args.epochs, eta_min=0, last_epoch=- 1, verbose=False)
+  
   if not os.path.exists(args.save):
     os.makedirs(args.save)
   if not os.path.isdir(args.save):
@@ -444,6 +554,8 @@ def main():
     writer.add_scalar('logs/train', train_loss_ema, epoch+1)
     writer.add_scalar('logs/test', test_loss, epoch+1)
     writer.add_scalar('acc/test', test_acc, epoch+1)
+    plt.plot(train_loss_ema)
+    plt.show()
 
     print(
         'Epoch {0:3d} | Time {1:5d} | Train Loss {2:.4f} | Test Loss {3:.3f} |'
@@ -458,6 +570,59 @@ def main():
     f.write('%03d,%05d,%0.6f,%0.5f,%0.2f\n' %
             (args.epochs + 1, 0, 0, 0, 100 - 100 * test_c_acc))
 
+  # /////////////// Get Results ///////////////
+
+  c_p_dir = './data/cifar/CIFAR-10-P'
+  num_classes = 10
+  dummy_targets = torch.LongTensor(np.random.randint(0, num_classes, (10000,)))
+  flip_list = []
+  zipf_list = []
+
+  for p in ['gaussian_noise', 'shot_noise', 'motion_blur', 'zoom_blur',
+            'spatter', 'brightness', 'translate', 'rotate', 'tilt', 'scale']:
+        # ,'speckle_noise', 'gaussian_blur', 'snow', 'shear']:
+    dataset = torch.from_numpy(np.float32(np.load(os.path.join('./data/cifar/CIFAR-10-P/' + p + '.npy')).transpose((0,1,4,2,3))))/255.
+
+    ood_data = torch.utils.data.TensorDataset(dataset, dummy_targets)
+
+    loader = torch.utils.data.DataLoader(
+            dataset, batch_size=25, shuffle=False, num_workers=2, pin_memory=True)
+
+    predictions, ranks = [], []
+
+    with torch.no_grad():
+
+        for data in loader:
+            num_vids = data.size(0)
+            data = data.view(-1,3,32,32).cuda()
+
+            output = net(data * 2 - 1)
+
+            for vid in output.view(num_vids, -1, num_classes):
+                predictions.append(vid.argmax(1).to('cpu').numpy())
+                ranks.append([np.uint16(rankdata(-frame, method='ordinal')) for frame in vid.to('cpu').numpy()])
+
+        ranks = np.asarray(ranks)
+
+        # print('\nComputing Metrics for', p,)
+
+        current_flip = flip_prob(predictions, True if 'noise' in p else False)
+        current_zipf = ranking_dist(ranks, True if 'noise' in p else False, mode='zipf')
+        flip_list.append(current_flip)
+        zipf_list.append(current_zipf)
+
+        print('\n' + p, 'Flipping Prob')
+        print(current_flip)
+        # print('Top5 Distance\t{:.5f}'.format(ranking_dist(ranks, True if 'noise' in p else False, mode='top5')))
+        # print('Zipf Distance\t{:.5f}'.format(current_zipf))
+
+  print(flip_list)
+  print('\nMean Flipping Prob\t{:.5f}'.format(np.mean(flip_list)))
+  # print('Mean Zipf Distance\t{:.5f}'.format(np.mean(zipf_list)))
+
+  acc, test_confidence, test_correct = evaluate(net, test_loader)
+  #print('Error', 100 - 100. * acc)
+
 
 if __name__ == '__main__':
-  main()
+    main()
