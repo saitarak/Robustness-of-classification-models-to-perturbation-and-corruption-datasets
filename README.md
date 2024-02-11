@@ -2,7 +2,7 @@
 
 <img align="center" src="assets/augmix.gif" width="750">
 
-## Introduction
+## Introductions
 
 We propose AugMix, a data processing technique that mixes augmented images and
 enforces consistent embeddings of the augmented images, which results in
